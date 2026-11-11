@@ -11,11 +11,17 @@ sudo install -D -m 644 "$(dirname "$0")/camera_server.py" /opt/inspect-robots-ne
 sudo tee /etc/systemd/system/zed-cameras.service >/dev/null <<EOF
 [Unit]
 Description=ZED X Nano frames over HTTP
-After=network-online.target zed_x_daemon.service
+# The SDK reads each camera's motion sensors through IMU_Daemon; without it the cameras fail to open.
+Wants=IMU_Daemon.service
+After=network-online.target zed_x_daemon.service IMU_Daemon.service
 
 [Service]
+# camera_server.py exits 3 when a camera stops giving frames (a GMSL link drop). Argus keeps the dropped camera's dead
+# session until its daemons restart, so that exit restarts them (as root: "+") before systemd starts the server again.
+ExecStopPost=+/bin/sh -c '[ "\$EXIT_STATUS" = 3 ] || exit 0; systemctl restart zed_x_daemon.service; sleep 3; systemctl restart nvargus-daemon.service; sleep 10'
 ExecStart=/usr/bin/python3 /opt/inspect-robots-nero/camera_server.py $*
 Restart=always
+RestartSec=3
 User=$USER
 
 [Install]

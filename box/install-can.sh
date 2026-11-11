@@ -10,6 +10,19 @@ set -euo pipefail
 LISTEN=${1:-$(ip -o -4 addr show | awk '$4 ~ /^192\.168\.123\.50\// {print $2; exit}')}
 [ -n "$LISTEN" ] || { echo "no interface holds 192.168.123.50; pass the one facing the laptop"; exit 1; }
 
+# JetPack's kernel ships without gs_usb, the candleLight stick's driver: build it from the same stable kernel release
+# (5.15.148 for JetPack 6.1's 5.15.148-tegra) against the installed headers.
+if ! modinfo gs_usb >/dev/null 2>&1; then
+  kver=$(uname -r)
+  src=$(mktemp -d)
+  curl -fsSL "https://git.kernel.org/pub/scm/linux/kernel/git/stable/linux.git/plain/drivers/net/can/usb/gs_usb.c?h=v${kver%%-*}" -o "$src/gs_usb.c"
+  echo "obj-m += gs_usb.o" > "$src/Makefile"
+  make -C "/lib/modules/$kver/build" M="$src" modules
+  sudo install -D -m 644 "$src/gs_usb.ko" "/lib/modules/$kver/updates/gs_usb.ko"
+  sudo depmod -a
+fi
+sudo modprobe gs_usb
+
 sudo tee /etc/udev/rules.d/99-nero-can.rules >/dev/null <<'EOF'
 ACTION!="remove", SUBSYSTEM=="net", ATTRS{idVendor}=="1d50", ATTRS{idProduct}=="606f", NAME="nerocan", TAG+="systemd", ENV{SYSTEMD_WANTS}+="nero-can@nerocan.service"
 EOF

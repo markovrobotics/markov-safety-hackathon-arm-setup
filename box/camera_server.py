@@ -8,6 +8,7 @@
     python3 camera_server.py wrist=<serial> tripod=<serial>
 """
 
+import os
 import sys
 import threading
 import time
@@ -16,9 +17,18 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import cv2
 import pyzed.sl as sl
 
-latest: dict[str, bytes] = {}
+latest: dict[str, tuple[float, bytes]] = {}  # eye -> (monotonic time grabbed, JPEG)
 fresh = threading.Condition()
 names: list[str] = []
+# A frame is served only while it is current. On 11-11 at 12:10:55 both cameras' GMSL links dropped; grab() failed on every
+# call from then on and the server kept answering with the 12:11 frames, so the grid showed them as live for 25 min.
+MAX_AGE = 1.0
+# The watchdog in __main__ ends the process when a camera has given no frame for LOST_S once open (or OPEN_S while it
+# opens): Argus keeps a dropped camera's dead session ("Device 0 (of 1) is in use"), so no reopen inside this process brings
+# it back. It exits 3, on which the unit restarts zed_x_daemon and nvargus-daemon before systemd starts it again.
+LOST_S, OPEN_S = 3.0, 60.0
+last_ok: dict[str, float] = {}  # camera -> monotonic time of its last good grab (or of the start, until it opens)
+is_open: dict[str, bool] = {}
 
 
 def grab(name: str, serial: int) -> None:
@@ -29,12 +39,16 @@ def grab(name: str, serial: int) -> None:
     while (err := cam.open(init)) != sl.ERROR_CODE.SUCCESS:
         print(f"{name} ({serial}): {err}; retrying in 2 s", file=sys.stderr, flush=True)
         time.sleep(2)
+    is_open[name] = True
+    last_ok[name] = time.monotonic()
     mat = sl.Mat()
     while True:
         if cam.grab() == sl.ERROR_CODE.SUCCESS:
+            now = time.monotonic()
             for view, key in ((sl.VIEW.LEFT, name), (sl.VIEW.RIGHT, f"{name}_right")):
                 cam.retrieve_image(mat, view, sl.MEM.CPU, sl.Resolution(640, 360))
-                latest[key] = cv2.imencode(".jpg", mat.get_data()[:, :, :3], [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes()
+                latest[key] = (now, cv2.imencode(".jpg", mat.get_data()[:, :, :3], [cv2.IMWRITE_JPEG_QUALITY, 90])[1].tobytes())
+            last_ok[name] = now
             with fresh:
                 fresh.notify_all()
 
@@ -80,11 +94,15 @@ class Handler(BaseHTTPRequestHandler):
         if "next" in query.split("&"):  # the grid's: answer with the next new frame, so it fetches at the camera's rate
             with fresh:
                 fresh.wait(1.0)
-        body = latest.get(path.removesuffix(".jpg"))
-        if body is None:
+        frame = latest.get(path.removesuffix(".jpg"))
+        if frame is None:
             self.send_error(404, f"cameras: {sorted(latest)}")
             return
-        self._send("image/jpeg", body)
+        age = time.monotonic() - frame[0]
+        if age > MAX_AGE:  # the grid dims a tile that gets no frame; every other reader gets the error, never an old frame
+            self.send_error(503, f"no frame for {age:.0f} s")
+            return
+        self._send("image/jpeg", frame[1])
 
     def _send(self, kind: str, body: bytes) -> None:
         self.send_response(200)
@@ -105,5 +123,14 @@ if __name__ == "__main__":
     for arg in sys.argv[1:]:
         name, serial = arg.split("=")
         names.append(name)
+        last_ok[name] = time.monotonic()
         threading.Thread(target=grab, args=(name, int(serial)), daemon=True).start()
-    ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever()
+    threading.Thread(target=ThreadingHTTPServer(("0.0.0.0", 8080), Handler).serve_forever, daemon=True).start()
+    while True:
+        time.sleep(0.5)
+        for name in names:
+            quiet = time.monotonic() - last_ok[name]
+            if quiet > (LOST_S if is_open.get(name) else OPEN_S):
+                print(f"{name}: no frame for {quiet:.0f} s; exiting so systemd resets the camera daemons and starts again",
+                      file=sys.stderr, flush=True)
+                os._exit(3)
