@@ -38,7 +38,11 @@ The agent policy reads `ANTHROPIC_API_KEY` from the environment or from a `.env`
 1. Start `uv run llm_bridge.py` in another terminal.
 2. Pass `-P model=claude/opus -P base_url=http://127.0.0.1:8765/v1`, or `model=codex/` for the Codex login's default model.
 
-Each turn is then one `claude -p` or `codex exec` call and takes a few seconds. To skip `--embodiment` and `--policy`, run `uv run inspect-robots setup` once and make them the defaults.
+Each turn is then one `claude -p` or `codex exec` call and takes a few seconds. `claude` must be logged in in the session that runs the bridge: over ssh to a Mac it can't reach the login keychain and answers "Not logged in", while `codex` works there.
+
+A run stops at whichever comes first: `--max-steps` (default 300 steps, which in our runs was about 18 model calls, since each call's move runs about 17 steps) or the agent's model-call budget, `-P max_llm_calls` (default 100). For a long run, raise both, e.g. `--max-steps 30000 -P max_llm_calls=800`.
+
+To skip `--embodiment` and `--policy`, run `uv run inspect-robots setup` once and make them the defaults.
 
 ## Addresses
 
