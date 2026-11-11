@@ -29,7 +29,9 @@ MAX_AGE = 1.0
 # The watchdog in __main__ ends the process when a camera has given no frame for LOST_S once open (or OPEN_S while it
 # opens): Argus keeps a dropped camera's dead session ("Device 0 (of 1) is in use"), so no reopen inside this process brings
 # it back. It exits 3, on which the unit restarts zed_x_daemon and nvargus-daemon before systemd starts it again.
-LOST_S, OPEN_S = 3.0, 60.0
+# OPEN_S is long because the first open after an SDK or depth model change downloads the depth model and optimizes it for
+# this GPU inside cam.open() ("may take a few minutes", 11-11 23:45); at 60 s the watchdog killed it every time.
+LOST_S, OPEN_S = 3.0, 900.0
 # The ZED X Nano has no depth sensor: the SDK computes depth from the two eyes on this box's GPU, where the full-size frames
 # are, rather than on the Air from the 640x360 JPEGs it gets.
 # SPEC-AMBIGUITY: (2026-11-11 15:50 Kaya asked for "it could be done if that's helpful, but it should be wherever it's faster")
