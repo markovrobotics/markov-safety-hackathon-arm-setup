@@ -34,7 +34,7 @@ WORKSPACE = ((-0.7, 0.7), (-0.7, 0.7), (0.09, 0.8))  # palm x, y, z bounds (m), 
 # roll and yaw become the same turn.
 ROTATION = ((-1.6, 1.6), (-1.3, 1.3), (-1.6, 1.6))
 JUMP_RAD = 0.3  # an IK answer that moves a joint more than this in one step is a flip to another arm configuration
-CAMERAS = ("wrist", "wrist_right", "tripod", "tripod_right")  # each ZED's left eye, then its right
+CAMERAS = ("wrist", "wrist_right", "wrist_depth", "tripod", "tripod_right", "tripod_depth")  # left eye, right eye, depth
 CAM_H, CAM_W = 360, 640  # what box/camera_server.py serves
 # The stall stop: a joint that cannot reach its target is stopped here and the model is told which way to go. On 11-11 the agent
 # pressed the open hand into the table and kept asking for more; the motors sat stalled at the 7 A cap until J7's driver
@@ -59,7 +59,11 @@ j1..j7 are the arm joints in radians, base to wrist. hand_* are the hand's DOFs:
 tucked beside the palm, 1 swung across to oppose the fingers.
 Cameras: "wrist" rides on the flange looking along the fingers; "tripod" is a
 fixed view of the table. Each is a stereo camera: "wrist" and "tripod" are its
-left eye, "wrist_right" and "tripod_right" its right eye, a few cm to the side. The arm's base stands on the table: the table top is
+left eye, "wrist_right" and "tripod_right" its right eye, a few cm to the side.
+"wrist_depth" and "tripod_depth" are the depth each camera's left eye sees,
+computed from its two eyes: grey, white at 0.1 m, black at 2.0 m and beyond,
+linear between (each grey level about 7.5 mm), black also where it has no
+depth (too near, occluded, shiny or textureless). The arm's base stands on the table: the table top is
 about z = 0.03 in the arm base frame.
 eef_pose is the palm's [x, y, z] in metres and [roll, pitch, yaw] in radians in
 the arm base frame, then the 6 hand DOFs. The palm point is the middle of the

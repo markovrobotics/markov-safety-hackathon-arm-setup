@@ -78,7 +78,7 @@ The observation is the same either way:
 - `joint_pos`: the 7 arm joints and the 6 hand DOFs.
 - `eef_pose`: the palm pose as above, then the 6 hand DOFs.
 - `hand_force`: per-DOF grip force, in the hand's raw units.
-- Both eyes of both cameras, 640x360: `wrist` and `tripod` (left eyes), `wrist_right` and `tripod_right`. The agent sees all four on every call.
+- Both eyes and the depth of both cameras, 640x360: `wrist` and `tripod` (left eyes), `wrist_right` and `tripod_right`, and `wrist_depth` and `tripod_depth`: the depth the left eye sees, computed by the ZED SDK from the two eyes on the box's GPU, grey from white at 0.1 m to black at 2.0 m and beyond (black also where there is no depth). The agent sees all six on every call.
 
 Steps run at 20 Hz. Joint targets go to the arm's firmware position mode (`move_j`), which smooths the motion and clamps each joint to its limits.
 
@@ -127,7 +127,7 @@ The ZED Box in the kit is already set up. To set up another:
 
 **Cameras.** The ZED X Nano needs ZED Box GMSL driver 1.4.2 or newer and ZED SDK 5.3 or newer. With older versions the box sees no camera (`dmesg`: "Error -1 setting gmsl link") or reports it as Unknown. Get both from stereolabs.com/developers; for the ZED Box Mini on JetPack 6.1 that is `stereolabs-zedbox-mini_1.4.4-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0_arm64.deb`, then reboot. Then copy `box/` over and run `./install.sh`:
 - With no arguments it lists the camera serial numbers.
-- `./install.sh wrist=<serial> tripod=<serial>` installs `camera_server.py` as a systemd service that starts on boot. It serves each camera's left image at `http://<box>:8080/<name>.jpg` and the right at `<name>_right.jpg` (the embodiment reads both), and every eye live in a grid at `http://<box>:8080/`. A frame older than 1 s is never served: the request gets a 503. When a camera gives no frame for 3 s (a GMSL link drop), the server exits, and the service restarts the ZED camera daemons and then the server, which brings the camera back.
+- `./install.sh wrist=<serial> tripod=<serial>` installs `camera_server.py` as a systemd service that starts on boot. It serves each camera's left image at `http://<box>:8080/<name>.jpg` the right at `<name>_right.jpg` and the depth at `<name>_depth.jpg` (the embodiment reads all three), and every eye live in a grid at `http://<box>:8080/`. A frame older than 1 s is never served: the request gets a 503. When a camera gives no frame for 3 s (a GMSL link drop), the server exits, and the service restarts the ZED camera daemons and then the server, which brings the camera back.
 
 **CAN.** Plug the arm's CAN cable into the candleLight USB-CAN stick (USB id 1d50:606f), and the stick into the box. Then run `box/install-can.sh` on the box. JetPack's kernel has no driver for the stick, so the script first builds the kernel's own `gs_usb` driver from the matching stable kernel source (it needs the box online, which the `laptop/` scripts give it). It brings the stick up as `nerocan` at 1 Mbit whenever it is plugged in, and serves it on port 29536 with [socketcand](https://github.com/linux-can/socketcand). The laptop opens that with python-can's `socketcand` interface.
 

@@ -10,6 +10,7 @@ import time
 import mujoco
 import numpy as np
 
+from inspect_robots_nero.cameras import DEPTH_FAR, DEPTH_NEAR
 from inspect_robots_nero.kinematics import _FLANGE, _JOINTS, LIMITS, PALM_Z
 
 JOINT_SPEED = 1.0  # rad/s each joint moves toward its target
@@ -109,8 +110,13 @@ class Sim:
             r = self._renderers.get(camera)
             if r is None:
                 r = self._renderers[camera] = mujoco.Renderer(self.model, CAM_H, CAM_W)
-            r.update_scene(self.data, camera=camera)
-            return r.render().copy()
+                if camera.endswith("_depth"):
+                    r.enable_depth_rendering()
+            r.update_scene(self.data, camera=camera.removesuffix("_depth"))
+            if not camera.endswith("_depth"):
+                return r.render().copy()
+            grey = ((DEPTH_FAR - r.render()) / (DEPTH_FAR - DEPTH_NEAR) * 255).clip(0, 255).astype(np.uint8)
+            return np.repeat(grey[:, :, None], 3, axis=2)  # the box's scale (cameras.py)
 
 
 class SimArm:
