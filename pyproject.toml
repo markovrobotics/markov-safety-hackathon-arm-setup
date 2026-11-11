@@ -1,0 +1,29 @@
+[project]
+name = "inspect-robots-nero"
+version = "0.1.0"
+description = "Inspect Robots embodiment for an AgileX NERO arm, an Inspire RH56DFTP hand and two ZED X Nano cameras"
+requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+dependencies = [
+    "inspect-robots>=1.0",
+    # the agent policy (--policy agent): any LLM drives the rig
+    "inspect-robots-agent>=0.30",
+    "numpy",
+    "pillow",
+    "pyAgxArm @ git+https://github.com/agilexrobotics/pyAgxArm@d90e234ba8e408cfa964b38aa9120b3131fc9f85",
+    "inspire-rh56dftp==0.1.0",
+    # macOS has no CAN driver: python-can talks to the candleLight (gs_usb) adapter over libusb, bundled by libusb-package
+    "gs_usb",
+    "libusb-package",
+]
+
+[project.entry-points."inspect_robots.embodiments"]
+nero = "inspect_robots_nero.embodiment:NeroEmbodiment"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.metadata]
+allow-direct-references = true
