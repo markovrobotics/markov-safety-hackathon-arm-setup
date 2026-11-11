@@ -1,7 +1,9 @@
 """Inspect Robots embodiment: NERO arm + Inspire hand + two ZED X Nano cameras.
 
-Action and joint_pos state are the same 13 numbers: 7 arm joint targets (rad)
-then 6 hand DOFs (0 closed .. 1 open). Configure with -E, e.g.
+With -E control=pose (the default) the action is the palm's pose then the hand: x, y, z (m) and roll, pitch, yaw (rad,
+0 = the palm's orientation when the trial started) in the arm base frame, then 6 hand DOFs (0 closed .. 1 open); the
+arm's joints come from inverse kinematics (kinematics.py). With -E control=joint it is 7 arm joint targets (rad) then
+the hand. -E sim=true runs it all on a MuJoCo stand-in (sim.py) instead of the rig. Configure the rig with -E, e.g.
 -E can=nerocan@192.168.123.50 -E can_interface=socketcand (the CAN stick on the ZED box, served over Ethernet;
 -E can=can0 -E can_interface=socketcan with it on a Linux laptop, -E can=0 -E can_interface=gs_usb on a Mac) -E hand_ip=192.168.11.210 -E box_url=http://192.168.123.50:8080
 """
@@ -19,9 +21,20 @@ from inspect_robots.types import Action, Observation, StepResult
 from inspect_robots_nero import cameras
 from inspect_robots_nero.arm import LIMITS, Arm
 from inspect_robots_nero.hand import DOFS, Hand
+from inspect_robots_nero.kinematics import Unreachable, check_table, euler, ik, palm, rpy
 
-LABELS = tuple(f"j{i}" for i in range(1, 8)) + tuple(f"hand_{d}" for d in DOFS)
-CAMERAS = ("wrist", "tripod")
+HAND_LABELS = tuple(f"hand_{d}" for d in DOFS)
+LABELS = tuple(f"j{i}" for i in range(1, 8)) + HAND_LABELS
+POSE_LABELS = ("x", "y", "z", "roll", "pitch", "yaw") + HAND_LABELS
+# The palm's box: walls at the arm's 0.7 m reach, a ceiling it can still reach under, and a floor at the lowest the palm
+# can sit with the hand level and clear of the table (kinematics.hand_low, which refuses any pose that brings the
+# open hand within CLEARANCE of the table: that check is the floor, this bound only tells the model the range)
+WORKSPACE = ((-0.7, 0.7), (-0.7, 0.7), (0.09, 0.8))  # palm x, y, z bounds (m), arm base frame
+# Rotations from the trial's start orientation about the base frame's x, y, z axes. Pitch stays clear of +-pi/2, where
+# roll and yaw become the same turn.
+ROTATION = ((-1.6, 1.6), (-1.3, 1.3), (-1.6, 1.6))
+JUMP_RAD = 0.3  # an IK answer that moves a joint more than this in one step is a flip to another arm configuration
+CAMERAS = ("wrist", "wrist_right", "tripod", "tripod_right")  # each ZED's left eye, then its right
 CAM_H, CAM_W = 360, 640  # what box/camera_server.py serves
 # The stall stop: a joint that cannot reach its target is stopped here and the model is told which way to go. On 11-11 the agent
 # pressed the open hand into the table and kept asking for more; the motors sat stalled at the 7 A cap until J7's driver
@@ -45,8 +58,22 @@ j1..j7 are the arm joints in radians, base to wrist. hand_* are the hand's DOFs:
 1.0 is open/extended, 0.0 closed/curled; hand_thumb_rotation 0 is the thumb
 tucked beside the palm, 1 swung across to oppose the fingers.
 Cameras: "wrist" rides on the flange looking along the fingers; "tripod" is a
-fixed view of the table. eef_pose is the flange [x, y, z] in metres and
-[roll, pitch, yaw] in radians, in the arm base frame.
+fixed view of the table. Each is a stereo camera: "wrist" and "tripod" are its
+left eye, "wrist_right" and "tripod_right" its right eye, a few cm to the side. The arm's base stands on the table: the table top is
+about z = 0.03 in the arm base frame.
+eef_pose is the palm's [x, y, z] in metres and [roll, pitch, yaw] in radians in
+the arm base frame, then the 6 hand DOFs. The palm point is the middle of the
+palm, on the hand's axis. roll, pitch, yaw turn the palm about the base frame's
+x, y and z axes, about the palm point, measured from its orientation when the
+trial started (0, 0, 0 = as it started).
+"""
+POSE_DOCS = """You command the palm: x, y, z, roll, pitch, yaw, and the hand DOFs. The arm's
+joints follow by inverse kinematics; joint_pos shows where they went. A pose the
+arm cannot reach (too far, past a joint limit, needing the arm to flip, or
+bringing the open hand within 1 cm of the table) stops the motion where it got
+to, and you are told why.
+"""
+JOINT_DOCS = """You command the arm's joints j1..j7 and the hand DOFs.
 """
 
 
@@ -60,8 +87,17 @@ class NeroEmbodiment:
         control_hz: float = 20.0,
         speed: int = 50,
         controller: str = CONTROLLER,
+        control: str = "pose",
+        sim: bool = False,
     ):
+        if control not in ("pose", "joint"):
+            raise ValueError(f"control must be pose or joint, got {control!r}")
         self.can, self.can_interface, self.hand_ip, self.box_url, self.speed = can, can_interface, hand_ip, box_url, speed
+        self.pose = control == "pose"
+        self.sim = sim if isinstance(sim, bool) else str(sim).lower() in ("1", "true", "yes")
+        self._start_rot = np.eye(3)  # the palm's orientation when the trial started: rotation targets are from it
+        self._rest = None
+        self._frame = None  # camera name -> its latest frame
         self.controller = controller or None
         self._watcher: threading.Thread | None = None
         self._stop: str | None = None  # why the watcher stopped the arm, until the model has been told
@@ -79,40 +115,51 @@ class NeroEmbodiment:
         self._t = 0.0
         # The action box is the range each joint can reach: the limits pyAgxArm clamps every move to, which match
         # what the controller reports (Arm.limits(), read 11-11). AgileX's spec sheet ranges are wider (j2 -15..190 deg).
-        low = [lo for lo, _ in LIMITS] + [0.0] * 6
-        high = [hi for _, hi in LIMITS] + [1.0] * 6
+        ranges = (*WORKSPACE, *ROTATION) if self.pose else LIMITS
+        low = [lo for lo, _ in ranges] + [0.0] * 6
+        high = [hi for _, hi in ranges] + [1.0] * 6
         self.info = EmbodimentInfo(
             name="nero",
             action_space=Box(
-                shape=(13,),
+                shape=(len(low),),
                 low=np.array(low),
                 high=np.array(high),
-                semantics=ActionSemantics(control_mode="joint_pos", dim_labels=LABELS),
+                semantics=ActionSemantics(control_mode="eef_abs_pose", dim_labels=POSE_LABELS) if self.pose
+                else ActionSemantics(control_mode="joint_pos", dim_labels=LABELS),
             ),
             observation_space=ObservationSpace(
                 cameras=tuple(CameraSpec(c, CAM_H, CAM_W) for c in CAMERAS),
                 state=StateSpec(
                     fields=(
                         StateField("joint_pos", (13,), "rad+normalized"),
-                        StateField("eef_pose", (6,), "m+rpy"),
+                        StateField("eef_pose", (12,), "m+rad+normalized"),
                         StateField("hand_force", (6,), "raw"),
                     )
                 ),
             ),
             control_hz=control_hz,
             capabilities=frozenset({SELF_PACED}),
-            docs=DOCS,
+            docs=DOCS + (POSE_DOCS if self.pose else JOINT_DOCS),
             morphology="nero-inspire",
         )
 
     def reset(self, scene: Scene, *, seed: int | None = None) -> Observation:
         if self.arm is None:
-            self.arm = Arm(self.can, self.speed, self.can_interface)
-            self.hand = Hand(self.hand_ip)
+            if self.sim:
+                from inspect_robots_nero.sim import Sim, SimArm, SimHand
+
+                world = Sim()
+                self.arm, self.hand, self._frame = SimArm(world), SimHand(world), world.frame
+            else:
+                self.arm = Arm(self.can, self.speed, self.can_interface)
+                self.hand = Hand(self.hand_ip)
+                self._frame = lambda c: cameras.frame(self.box_url, c)
             self._watcher = threading.Thread(target=self._watch, daemon=True)
             self._watcher.start()
         self._stop, self._walls, self._still, self._skipping = None, {}, {}, False
         self._instruction = scene.instruction
+        self._rest = np.array(self.arm.joints())  # the posture the IK keeps the arm near: how it started the trial
+        self._start_rot = palm(self._rest)[:3, :3]
         self._t = time.monotonic()
         return self._observe()
 
@@ -127,8 +174,22 @@ class NeroEmbodiment:
                 # and its last step's observation carries why, as a replan note the agent reads after the motion. The
                 # agent marks every motion's last action chunk_final.
                 self._skipping = True
-            if not self._skipping:
+            if not self._skipping and self.pose:
+                try:
+                    arm = self._joints_for(target[:6])
+                except Unreachable as e:
+                    # Nothing more of this motion is sent: the arm finishes the last reachable step and holds there.
+                    at = self._observe_pose()
+                    self._stop = (f"the palm stopped short of x={target[0]:.3f} y={target[1]:.3f} z={target[2]:.3f} "
+                                  f"roll={target[3]:.2f} pitch={target[4]:.2f} yaw={target[5]:.2f}: {e}. The arm went "
+                                  "as far as the motion stayed reachable and is holding there, at "
+                                  + " ".join(f"{n}={v:.3f}" for n, v in zip(POSE_LABELS, at)) + ". Pick a nearer "
+                                  "point or another orientation, and name all six of x, y, z, roll, pitch, yaw in the "
+                                  "next move: one left out keeps the unreachable value it had here")
+                    self._skipping = True
+            elif not self._skipping:
                 arm = target[:7].copy()
+            if not self._skipping:
                 for j, (at, push) in list(self._walls.items()):
                     if (arm[j] - at) * push > 0:
                         arm[j] = at  # not further into what stopped it
@@ -136,7 +197,7 @@ class NeroEmbodiment:
                         del self._walls[j]  # commanded the other way: the wall is gone
                 self.arm.move(arm)
         if not self._skipping:
-            self.hand.move(target[7:])
+            self.hand.move(target[-6:])
             time.sleep(max(0.0, 1 / self.info.control_hz - (time.monotonic() - self._t)))
         self._t = time.monotonic()
         observation = self._observe()
@@ -148,6 +209,28 @@ class NeroEmbodiment:
                 extra={**observation.extra, "replan": {"trigger": "arm_stop", "reason": reason}},
             )
         return StepResult(observation=observation)
+
+    def _joints_for(self, pose) -> np.ndarray:
+        """The arm joints that put the palm at pose (x, y, z, then roll, pitch, yaw from the trial's start
+        orientation), from inverse kinematics started at the last joint target. Raises Unreachable, also for a pose
+        that brings the open hand nearer the table than it may go."""
+        seed = np.array(self.arm.target if self.arm.target is not None else self.arm.joints())
+        goal = np.eye(4)
+        goal[:3, :3] = euler(pose[3:]) @ self._start_rot
+        goal[:3, 3] = pose[:3]
+        check_table(goal, palm(seed))
+        q = ik(goal, seed, self._rest)
+        jump = np.abs(q - seed)
+        if jump.max() > JUMP_RAD:
+            j = int(jump.argmax())
+            raise Unreachable(f"getting there needs j{j + 1} to swing {jump[j]:.2f} rad at once, a flip to another arm "
+                              "configuration")
+        return q
+
+    def _observe_pose(self, joints=None) -> list[float]:
+        """The palm's x, y, z and roll, pitch, yaw from the trial's start orientation, from the measured joints."""
+        here = palm(self.arm.joints() if joints is None else joints)
+        return [*here[:3, 3], *rpy(here[:3, :3] @ self._start_rot.T)]
 
     def _watch(self) -> None:
         """Beside the control loop, every WATCH_S: hold the arm the moment a joint stalls or a driver flags trouble,
@@ -208,8 +291,10 @@ class NeroEmbodiment:
                     f"of its target {target[j]:.3f}, and did not move for {STALL_S:g} s. The arm backed j{j + 1} off to "
                     f"{held[j]:.3f} and is holding there, and j{j + 1} "
                     f"will not be driven past {held[j]:.3f} in the {'increasing' if push > 0 else 'decreasing'} direction "
-                    f"until you command it the other way. Something is in the way: move j{j + 1} the other way "
-                    f"({'decrease' if push > 0 else 'increase'} it), or move the other joints to clear what it is pressing into")
+                    f"until it is commanded the other way. Something is in the way: "
+                    + ("move the palm back the way it came, or around what it is pressing into" if self.pose else
+                       f"move j{j + 1} the other way ({'decrease' if push > 0 else 'increase'} it), or move the other "
+                       "joints to clear what it is pressing into"))
             return
 
     def _recover(self) -> None:
@@ -243,11 +328,12 @@ class NeroEmbodiment:
 
     def _observe(self) -> Observation:
         now = time.monotonic()
+        joints, hand = self.arm.joints(), self.hand.angles()
         return Observation(
-            images={c: cameras.frame(self.box_url, c) for c in CAMERAS},
+            images={c: self._frame(c) for c in CAMERAS},
             state={
-                "joint_pos": np.array(self.arm.joints() + self.hand.angles()),
-                "eef_pose": np.array(self.arm.flange_pose()),
+                "joint_pos": np.array(joints + hand),
+                "eef_pose": np.array([*self._observe_pose(joints), *hand]),
                 "hand_force": np.array(self.hand.forces()),
             },
             instruction=self._instruction,

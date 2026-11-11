@@ -63,21 +63,41 @@ Other settings: `-E speed=50` (percent of the arm's top speed) and `-E control_h
 
 ## Embodiment
 
-- Action: 13 numbers. The 7 arm joint targets (rad, base to wrist), then the 6 hand DOFs (pinky, ring, middle, index, thumb bend, thumb rotation; 0 closed, 1 open).
-- Observation:
-  - `joint_pos`: the same 13 numbers.
-  - `eef_pose`: the flange position in metres and its roll/pitch/yaw in radians, in the arm base frame.
-  - `hand_force`: per-DOF grip force, in the hand's raw units.
-  - The `wrist` and `tripod` images, 640x360.
-- Steps run at 20 Hz.
-- Joint targets go to the arm's firmware position mode (`move_j`), which smooths the motion and clamps each joint to its limits.
+Two ways to command the arm, picked with `-E control=`:
+
+- **`pose` (the default).** The action is 12 numbers: the palm's `x, y, z` in metres and `roll, pitch, yaw` in radians, then the 6 hand DOFs (pinky, ring, middle, index, thumb bend, thumb rotation; 0 closed, 1 open). The agent gets a `move_to` tool over these.
+  - The palm point is the middle of the palm, on the hand's axis, 10.5 cm out from the arm's flange face (the printed mount plus the hand to mid-palm).
+  - `x, y, z` are in the arm's base frame. The base stands on the table, and the table top is about z = 0.03.
+  - `roll, pitch, yaw` turn the palm about the base frame's x, y and z axes, about the palm point. They count from the palm's orientation when the trial started, so `0, 0, 0` is how it started.
+  - The palm stays inside a box: x and y within ±0.7 m, z from 0.09 to 0.8 m. Pitch stays within ±1.3 rad and roll and yaw within ±1.6 rad.
+  - No pose may bring the hand within 1 cm of the table, counted with the fingers open, from the flange face to the fingertips. With the fingers pointing down, the palm stays about 17 cm up.
+  - The arm's joints come from inverse kinematics on AgileX's URDF (`kinematics.py`). It matches the arm's own flange readings to 0.07 mm and 0.01°. If a motion reaches a pose the arm cannot reach (too far, past a joint limit, too close to the table, or needing the arm to flip to another configuration), the arm stops at the last reachable point. The model is told why and how close it got.
+- **`joint`.** The action is 13 numbers: the 7 arm joint targets (rad, base to wrist), then the 6 hand DOFs. The agent gets a `move_joints` tool.
+
+The observation is the same either way:
+- `joint_pos`: the 7 arm joints and the 6 hand DOFs.
+- `eef_pose`: the palm pose as above, then the 6 hand DOFs.
+- `hand_force`: per-DOF grip force, in the hand's raw units.
+- Both eyes of both cameras, 640x360: `wrist` and `tripod` (left eyes), `wrist_right` and `tripod_right`. The agent sees all four on every call.
+
+Steps run at 20 Hz. Joint targets go to the arm's firmware position mode (`move_j`), which smooths the motion and clamps each joint to its limits.
+
+### Without the rig
+
+`-E sim=true` runs the same embodiment on a MuJoCo stand-in (`sim.py`). It has the NERO's kinematics drawn as capsules, a box-and-finger hand, the table and a few objects, and both cameras are rendered. Install it with `uv sync --extra sim`:
+
+```bash
+uv run inspect-robots run --instruction "touch the orange bottle" --embodiment nero -E sim=true --policy agent -P model=anthropic/claude-fable-5
+```
+
+In the sim, joints move straight to their targets at 1 rad/s. Nothing collides, stalls or faults.
 
 ## When something goes wrong
 
 **A joint is blocked.** A joint can stop more than 0.05 rad short of its target and not move for 0.5 s, because something is in its way or it is at a limit. The arm then:
 1. backs that joint off 0.05 rad and holds there;
 2. drops the rest of the current motion;
-3. tells the model which joint stopped, where, and which way to move it.
+3. tells the model which joint stopped and where, and which way to move it (in `pose` control, to move the palm back the way it came).
 
 The joint is not driven further in the blocked direction until the model commands it the other way. Without this, the motors push at their current cap until a joint driver latches a fault and the arm loses power.
 
@@ -107,7 +127,7 @@ The ZED Box in the kit is already set up. To set up another:
 
 **Cameras.** The ZED X Nano needs ZED Box GMSL driver 1.4.2 or newer and ZED SDK 5.3 or newer. With older versions the box sees no camera (`dmesg`: "Error -1 setting gmsl link") or reports it as Unknown. Get both from stereolabs.com/developers; for the ZED Box Mini on JetPack 6.1 that is `stereolabs-zedbox-mini_1.4.4-SL-MAX9296-ZEDBOX-MINI-L4T36.4.0_arm64.deb`, then reboot. Then copy `box/` over and run `./install.sh`:
 - With no arguments it lists the camera serial numbers.
-- `./install.sh wrist=<serial> tripod=<serial>` installs `camera_server.py` as a systemd service that starts on boot. It serves each camera's left image at `http://<box>:8080/<name>.jpg` (the one the embodiment reads), the right at `<name>_right.jpg`, and every eye live in a grid at `http://<box>:8080/`. A frame older than 1 s is never served: the request gets a 503. When a camera gives no frame for 3 s (a GMSL link drop), the server exits, and the service restarts the ZED camera daemons and then the server, which brings the camera back.
+- `./install.sh wrist=<serial> tripod=<serial>` installs `camera_server.py` as a systemd service that starts on boot. It serves each camera's left image at `http://<box>:8080/<name>.jpg` and the right at `<name>_right.jpg` (the embodiment reads both), and every eye live in a grid at `http://<box>:8080/`. A frame older than 1 s is never served: the request gets a 503. When a camera gives no frame for 3 s (a GMSL link drop), the server exits, and the service restarts the ZED camera daemons and then the server, which brings the camera back.
 
 **CAN.** Plug the arm's CAN cable into the candleLight USB-CAN stick (USB id 1d50:606f), and the stick into the box. Then run `box/install-can.sh` on the box. JetPack's kernel has no driver for the stick, so the script first builds the kernel's own `gs_usb` driver from the matching stable kernel source (it needs the box online, which the `laptop/` scripts give it). It brings the stick up as `nerocan` at 1 Mbit whenever it is plugged in, and serves it on port 29536 with [socketcand](https://github.com/linux-can/socketcand). The laptop opens that with python-can's `socketcand` interface.
 
